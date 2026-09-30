@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 410" width="680" height="410" role="img" font-family="Helvetica, Arial, sans-serif">
+  <title>ESP32 to MAX30102 wiring</title>
+  <desc>Four wires: ESP32 3V3 to VIN, GPIO22 to SCL, GPIO21 to SDA, GND to GND. INT, IRD and RD stay unconnected.</desc>
+  <rect x="0.5" y="0.5" width="679" height="409" rx="12" fill="#ffffff" stroke="#d3d1c7"/>
+
+  <rect x="50" y="40" width="200" height="340" rx="8" fill="#f1efe8" stroke="#5f5e5a"/>
+  <text x="150" y="68" text-anchor="middle" font-size="15" font-weight="bold" fill="#2c2c2a">ESP32 dev board</text>
+  <text x="150" y="86" text-anchor="middle" font-size="12" fill="#5f5e5a">DevKit / WROOM-32 pinout</text>
+
+  <rect x="430" y="40" width="200" height="340" rx="8" fill="#eeedfe" stroke="#534ab7"/>
+  <text x="530" y="68" text-anchor="middle" font-size="15" font-weight="bold" fill="#26215c">MAX30102 module</text>
+  <text x="530" y="86" text-anchor="middle" font-size="12" fill="#534ab7">pin order: check the silkscreen</text>
+
+  <g font-size="14" fill="#2c2c2a">
+    <text x="236" y="115" text-anchor="end">3V3</text>
+    <text x="236" y="160" text-anchor="end">GPIO22</text>
+    <text x="236" y="205" text-anchor="end">GPIO21</text>
+    <text x="236" y="355" text-anchor="end">GND</text>
+  </g>
+  <g font-size="14" fill="#26215c">
+    <text x="444" y="115">VIN</text>
+    <text x="444" y="160">SCL</text>
+    <text x="444" y="205">SDA</text>
+    <text x="444" y="250" fill="#888780">INT</text>
+    <text x="444" y="285" fill="#888780">IRD</text>
+    <text x="444" y="320" fill="#888780">RD</text>
+    <text x="444" y="355">GND</text>
+  </g>
+  <g font-size="12" fill="#888780" font-style="italic">
+    <text x="500" y="250">not connected</text>
+    <text x="500" y="285">not connected</text>
+    <text x="500" y="320">not connected</text>
+  </g>
+
+  <g stroke-width="4" stroke-linecap="round">
+    <line x1="250" y1="110" x2="430" y2="110" stroke="#e24b4a"/>
+    <line x1="250" y1="155" x2="430" y2="155" stroke="#ef9f27"/>
+    <line x1="250" y1="200" x2="430" y2="200" stroke="#378add"/>
+    <line x1="250" y1="350" x2="430" y2="350" stroke="#444441"/>
+  </g>
+  <g font-size="12" fill="#5f5e5a" text-anchor="middle">
+    <text x="340" y="101">3.3 V power</text>
+    <text x="340" y="146">I2C clock</text>
+    <text x="340" y="191">I2C data</text>
+    <text x="340" y="341">ground</text>
+  </g>
+  <g>
+    <circle cx="250" cy="110" r="5" fill="#e24b4a"/><circle cx="430" cy="110" r="5" fill="#e24b4a"/>
+    <circle cx="250" cy="155" r="5" fill="#ef9f27"/><circle cx="430" cy="155" r="5" fill="#ef9f27"/>
+    <circle cx="250" cy="200" r="5" fill="#378add"/><circle cx="430" cy="200" r="5" fill="#378add"/>
+    <circle cx="250" cy="350" r="5" fill="#444441"/><circle cx="430" cy="350" r="5" fill="#444441"/>
+    <circle cx="430" cy="245" r="4" fill="#ffffff" stroke="#888780" stroke-width="1.5"/>
+    <circle cx="430" cy="280" r="4" fill="#ffffff" stroke="#888780" stroke-width="1.5"/>
+    <circle cx="430" cy="315" r="4" fill="#ffffff" stroke="#888780" stroke-width="1.5"/>
+  </g>
+</svg>

@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# PlatformIO build output (ppg/.gitignore covers it too)
+.pio/
+
+# Personal recordings and trained models: create your own with collect.py / train.py
+host/data/
+host/models/
+
+# macOS / editors
+.DS_Store
+.idea/
