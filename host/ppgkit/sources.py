@@ -59,6 +59,7 @@ class Source:
         self._running = False
         self.total = 0
         self.dropped = 0
+        self.last_rx = time.time()  # when samples last arrived, for stall warnings
         self.info: dict[str, str] = {}
         self.status = ""
 
@@ -89,6 +90,11 @@ class Source:
             self._red.extend(red)
             self._ir.extend(ir)
             self.total += len(red)
+            self.last_rx = time.time()
+
+    def stalled(self, seconds=1.0):
+        """True when a live source has delivered nothing for `seconds` (unplugged, board reset)."""
+        return self._running and time.time() - self.last_rx > seconds
 
     def _run(self):
         raise NotImplementedError
@@ -132,10 +138,13 @@ class SerialSource(Source):
         self._last_seq = None
         self._last = None
         self._queued: list[str] = []
+        self._commands: list[str] = []
 
     def queue(self, command: str):
-        """Send `command` once data is flowing (opening the port resets most ESP32 boards)."""
+        """Send `command` once data is flowing (opening the port resets most ESP32 boards).
+        It is sent again whenever the board restarts, since the firmware forgets its settings."""
         self._queued.append(command)
+        self._commands.append(command)
 
     def send(self, command: str):
         self.ser.write((command.strip() + "\n").encode())
@@ -171,6 +180,7 @@ class SerialSource(Source):
         self.status = text
         if text.startswith("MAX30102 streamer"):
             self._last_seq = None  # board (re)started, seq begins again at 0
+            self._queued = list(self._commands)
         for token in text.split():
             key, eq, value = token.partition("=")
             if eq:
@@ -186,11 +196,15 @@ class SerialSource(Source):
             seq, red, ir = (int(p) for p in parts)
         except ValueError:
             return  # boot noise
+        if not (0 <= red < 1 << 18 and 0 <= ir < 1 << 18):
+            return  # corrupted line (the sensor is 18-bit)
         if self.swap:
             red, ir = ir, red
         if self._last_seq is not None:
             gap = seq - self._last_seq - 1
-            if 0 < gap <= 2 * self.fs:
+            if gap < 0:  # counter went backwards without a banner: treat as a restart
+                self._last_seq = None
+            elif 0 < gap <= 10 * self.fs:
                 w = np.arange(1, gap + 1) / (gap + 1)
                 reds.extend(self._last[0] + (red - self._last[0]) * w)
                 irs.extend(self._last[1] + (ir - self._last[1]) * w)
@@ -229,9 +243,27 @@ class ReplaySource(Source):
 
 # ------------------------------------------------------------ session io ----
 
-def save_session(path, red, ir, fs, events=(), calib=None, meta=None):
-    """Save raw data plus (sample_index, label) events; written atomically."""
+# Where each recorded trial ends (sample indices, -1 = not known). `event_index` is the cue.
+#   go_end      the "go" window closed: the gesture should be finished and released
+#   end         the trial is over, rest included (the next trial's "ready" starts here)
+#   move_start  start and end of the movement the live detector found after the cue,
+#   move_end    -1 when it found none
+SPAN_KEYS = ("go_end", "end", "move_start", "move_end")
+
+
+def save_session(path, red, ir, fs, events=(), calib=None, meta=None, spans=None):
+    """Save raw data plus (sample_index, label) events; written atomically.
+
+    `spans` is optional: one dict per event with any of SPAN_KEYS (see above).
+    """
     events = list(events)
+    extra = {}
+    if spans is not None:
+        spans = list(spans)
+        if len(spans) != len(events):
+            raise ValueError("spans must have one entry per event")
+        for key in SPAN_KEYS:
+            extra["event_" + key] = np.array([int(s.get(key, -1)) for s in spans], dtype=np.int64)
     tmp = path[:-4] + ".tmp.npz" if path.endswith(".npz") else path + ".tmp.npz"
     np.savez_compressed(
         tmp,
@@ -242,18 +274,25 @@ def save_session(path, red, ir, fs, events=(), calib=None, meta=None):
         event_label=np.array([e[1] for e in events], dtype=str),
         calib=np.array(calib if calib else (-1, -1), dtype=np.int64),
         meta=np.array(json.dumps(meta or {}, ensure_ascii=False)),
+        **extra,
     )
     os.replace(tmp, path)
 
 
 def load_session(path):
+    """Returns a dict with red, ir, fs, events [(cue index, label)], calib, meta and
+    spans: one dict per event with the SPAN_KEYS that were recorded, or None for
+    recordings made before end markers existed."""
     with np.load(path) as z:
         calib = tuple(int(v) for v in z["calib"])
+        n = len(z["event_index"])
+        keys = [k for k in SPAN_KEYS if "event_" + k in z.files]
         return {
             "red": z["red"].astype(float),
             "ir": z["ir"].astype(float),
             "fs": float(z["fs"]),
             "events": [(int(i), str(l)) for i, l in zip(z["event_index"], z["event_label"])],
+            "spans": [{k: int(z["event_" + k][i]) for k in keys} for i in range(n)] if keys else None,
             "calib": calib if calib[0] >= 0 else None,
             "meta": json.loads(str(z["meta"])),
         }

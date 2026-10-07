@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.ndimage import median_filter
+from scipy.ndimage import median_filter, uniform_filter1d
 from scipy.signal import butter, find_peaks, lombscargle, sosfiltfilt, welch
 
 FULL_SCALE = 2 ** 18 - 1  # 18-bit ADC
@@ -134,3 +134,58 @@ def signal_quality(dc_ir, pi):
     if pi < 0.05:
         return "脈搏很弱：貼緊、遮光"
     return "良好"
+
+
+def motion_percent(x, fs, win=3.0):
+    """How much the signal moved over the last `win` s: peak-to-peak of the 0.5 s moving
+    average (which removes most of the pulse), in % of the signal level. A still hand
+    gives well under 1 %, a gesture or arm movement several %."""
+    seg = np.asarray(x[-int(win * fs):], float)
+    if len(seg) < int(1.0 * fs):
+        return 0.0
+    m = uniform_filter1d(seg, max(1, int(0.5 * fs)), mode="nearest")
+    m = m[int(0.25 * fs):-int(0.25 * fs)]
+    return 100.0 * np.ptp(m) / max(abs(np.median(seg)), 1.0)
+
+
+STILL_LIMIT = 1.0  # % motion that still counts as "keeping still"
+
+
+def rest_check(red, ir, fs):
+    """Is the sensor in a state where a gesture recording may start?
+
+    Returns dc (IR level, % of full scale), pi (pulse amplitude, % of DC), motion (%),
+    and for each of the three conditions a (passed, message) pair.
+    """
+    dc = 100.0 * np.mean(ir[-int(2 * fs):]) / FULL_SCALE
+    pi = perfusion_index(ir[-int(5 * fs):], fs)
+    motion = max(motion_percent(red, fs), motion_percent(ir, fs))
+    if dc < 10:
+        contact = (False, "沒貼到皮膚，或 LED 太弱（可加 --led 100）")
+    elif dc < 20:
+        contact = (False, "訊號偏低：貼緊一點，或加大 --led")
+    elif dc > 90:
+        contact = (False, "飽和了：調小 --led，或加大 --range")
+    elif dc > 85:
+        contact = (False, "偏高，做手勢時可能飽和：調小 --led")
+    else:
+        contact = (True, "建議落在 30–70 %" if not 30 <= dc <= 70 else "")
+    pulse = (pi >= 0.05, "" if pi >= 0.05 else "看不到脈搏：貼緊一點、遮光")
+    still = (motion < STILL_LIMIT, "" if motion < STILL_LIMIT else "有在動：手放鬆平放，不要說話、不要碰線")
+    return {"dc": dc, "pi": pi, "motion": motion, "contact": contact, "pulse": pulse, "still": still}
+
+
+FIT_TOLERANCE = 0.15  # the IR level may differ this much (relative) from the target and still count as "same fit"
+
+
+def fit_metrics(red, ir, fs):
+    """How snugly the sensor sits, as two numbers: IR level (% of full scale, rises when the
+    sensor presses harder or sits closer to the skin) and pulse amplitude (% of DC). Only
+    comparable between recordings made with the same --led and --range."""
+    return {"dc": 100.0 * float(np.mean(ir[-int(2 * fs):])) / FULL_SCALE,
+            "pi": float(perfusion_index(np.asarray(ir[-int(5 * fs):], float), fs))}
+
+
+def fit_summary(session_fits):
+    """Median target over several sessions' fit_metrics results."""
+    return {k: float(np.median([f[k] for f in session_fits])) for k in ("dc", "pi")}
