@@ -23,7 +23,7 @@ training and chunk by chunk in predict.py, so live segments match training.
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 import numpy as np
 from scipy.linalg import solve_toeplitz
@@ -34,8 +34,10 @@ from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
 from sklearn.multiclass import OneVsRestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 from .sources import GrowBuffer
@@ -64,7 +66,12 @@ PRESETS = {
 }
 
 
+NONE = "none"  # not a gesture: release edge, twitch, ... (a class the model can learn to reject)
+
+
 def display_name(label):
+    if label == NONE:
+        return "（無手勢）"
     return GESTURES.get(label, label)
 
 
@@ -77,6 +84,8 @@ class SegConfig:
     energy_win: float = 0.25  # s
     threshold: str = "robust"  # "robust": median + k_mad * MAD of the rest energy; "paper": mean + k_sigma * std
     k_mad: float = 10.0
+    step_min: float = 0.006  # the threshold never drops below the energy of a 0.6 % level step (a very still calibration would make it trigger on noise)
+    step_max: float = 0.014  # nor rises above a 1.4 % step (a calibration with movement in it would hide the gestures)
     k_sigma: float = 3.0  # A: threshold = mu + 3 sigma of the energy at rest
     min_above: float = 0.03  # s above threshold before a trigger
     pre: float = 1.0  # s kept before the trigger
@@ -88,6 +97,8 @@ class SegConfig:
     min_len: float = 0.5
     max_len: float = 3.0
     pad: float = 0.1
+    win_pre: float = 0.3  # s before the trigger kept in the fixed "win" window
+    win_post: float = 3.0  # s after the trigger (must not exceed `wait`)
 
 
 @dataclass
@@ -158,23 +169,45 @@ class Trigger:
         return onsets
 
 
+def step_energy(cfg: SegConfig, size=0.01):
+    """Peak detector energy that a level step of `size` (fraction of the DC level) produces."""
+    n = int(4 * cfg.fs)
+    x = np.ones(n)
+    x[n // 2:] += size
+    return float(Detector(cfg, Calibration(np.ones(2), np.ones(2))).process(x, x).max())
+
+
 def calibrate(red, ir, cfg: SegConfig) -> Calibration:
     """Energy threshold from a rest period.
 
     Paper A uses mu + 3 sigma. On real recordings one twitch during the rest
     period inflates sigma enough to hide most gestures, so the default uses
-    the median and MAD instead, which ignore short movements.
+    the median and MAD instead, which ignore short movements. Because the
+    rest period can also be too clean (noise then triggers) or too restless
+    (gestures then stay below the threshold), the result is kept between the
+    energy of a `step_min` and a `step_max` level step.
     """
     x = np.vstack([red, ir]).astype(float)
     dc = x.mean(axis=1)
     e = Detector(cfg, Calibration(dc, np.ones(2))).process(x[0], x[1])
-    e = e[:, int(1.0 * cfg.fs):]  # skip the filter start-up
+    skip = int(1.0 * cfg.fs)  # skip the filter start-up
+    if e.shape[1] <= skip + int(0.5 * cfg.fs):
+        raise ValueError("校正資料太短（要 1.5 秒以上，建議 8 秒）")
+    e = e[:, skip:]
     if cfg.threshold == "paper":
         tau = e.mean(axis=1) + cfg.k_sigma * e.std(axis=1)
     else:
         med = np.median(e, axis=1)
         tau = med + cfg.k_mad * 1.4826 * np.median(np.abs(e - med[:, None]), axis=1)
+        unit = step_energy(cfg) / 0.01 ** 2
+        tau = np.clip(tau, unit * cfg.step_min ** 2, unit * cfg.step_max ** 2)
     return Calibration(dc, np.maximum(tau, 1e-12))
+
+
+def threshold_percent(cal: Calibration, cfg: SegConfig):
+    """The calibration threshold as the size of a level step (in %) that just reaches it."""
+    unit = step_energy(cfg) / 0.01 ** 2
+    return 100.0 * float(np.sqrt(cal.tau.max() / unit))
 
 
 # --------------------------------------------------------- segmentation ----
@@ -242,12 +275,17 @@ def extract(red, ir, onset, cal: Calibration, cfg: SegConfig):
 
     v = 100.0 * sosfiltfilt(butter(4, cfg.lp_cut, "lowpass", fs=fs, output="sos"), u, axis=1)
     step = max(1, int(round(fs / cfg.feat_fs)))
-    return {"seg": v[:, s:t:step], "start": a + s, "end": a + t}
+    # fixed window anchored at the trigger: baseline, the action, the held plateau and the release
+    w0, w1 = int(round((cfg.pre - cfg.win_pre) * fs)), int(round((cfg.pre + cfg.win_post) * fs))
+    return {"seg": v[:, s:t:step], "win": v[:, w0:w1:step], "start": a + s, "end": a + t}
 
 
-def segment_session(session, cfg: SegConfig):
+def segment_session(session, cfg: SegConfig, field="seg", with_none=False):
     """Calibrate on the session's rest period, run the live detector over it and
-    cut one segment per cue. Returns (segments, labels, report)."""
+    cut one segment per cue. `field` picks what is cut: "seg" (the energy burst) or
+    "win" (the fixed window around the trigger). With `with_none`, triggers that match
+    no cue (release edges, twitches) are added as the "none" class so the model can
+    reject them. Returns (segments, labels, report), in recording order."""
     red, ir = session["red"], session["ir"]
     if abs(session["fs"] - cfg.fs) > 1e-6:
         raise ValueError(f"sample rate {session['fs']} Hz != {cfg.fs} Hz")
@@ -258,7 +296,7 @@ def segment_session(session, cfg: SegConfig):
     det, trig = Detector(cfg, cal), Trigger(cfg)
     onsets = trig.feed(det.process(red[c1:], ir[c1:]).max(axis=0), c1)
 
-    segs, labels, used = [], [], set()
+    items, used = [], set()
     for cue, label in session["events"]:
         near = [o for o in onsets if cue - 0.3 * cfg.fs <= o <= cue + 3.0 * cfg.fs and o not in used]
         if not near:
@@ -267,11 +305,19 @@ def segment_session(session, cfg: SegConfig):
         if r is None or r["seg"].shape[1] < 8:
             continue
         used.add(near[0])
-        segs.append(r["seg"])
-        labels.append(label)
-    report = {"cues": len(session["events"]), "segments": len(segs),
-              "missed": len(session["events"]) - len(segs), "extra_triggers": len(onsets) - len(used)}
-    return segs, labels, report
+        items.append((near[0], r[field], label))
+    n_cue = len(items)
+    if with_none:
+        for o in onsets:
+            if o in used:
+                continue
+            r = extract(red, ir, o, cal, cfg)
+            if r is not None and r["seg"].shape[1] >= 8:
+                items.append((o, r[field], NONE))
+    items.sort(key=lambda it: it[0])
+    report = {"cues": len(session["events"]), "segments": n_cue,
+              "missed": len(session["events"]) - n_cue, "extra_triggers": len(onsets) - len(used)}
+    return [it[1] for it in items], [it[2] for it in items], report
 
 
 def as_objects(segs):
@@ -294,6 +340,7 @@ def _stats(x):
 
 
 def _fft(x, fs, fmax=5.0, nfft=256):
+    nfft = max(nfft, len(x))  # rfft(n) would cut off the tail of a longer segment
     mag = np.abs(np.fft.rfft(x - x.mean(), nfft))[1:]
     mag = mag[np.fft.rfftfreq(nfft, 1 / fs)[1:] <= fmax]
     return [skew(mag), kurtosis(mag), mag.mean(), np.median(mag), mag.var(), np.ptp(mag)]
@@ -492,12 +539,36 @@ class LinearSVM(BaseEstimator, ClassifierMixin):
         return (self.model_.predict(X)[:, None] == self.classes_).astype(float)
 
 
+class WaveFeaturizer(BaseEstimator, TransformerMixin):
+    """Fixed trigger-anchored window (2, m) -> flat waveform at `rate` Hz (red then IR)."""
+
+    def __init__(self, fs=100.0, rate=20.0):
+        self.fs = fs
+        self.rate = rate
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        k = max(1, int(round(self.fs / self.rate)))
+        m = min(s.shape[1] for s in X) // k * k
+        out = np.array([s[:, :m].reshape(2, -1, k).mean(axis=2).ravel() for s in X])
+        return np.nan_to_num(out)
+
+
 MODELS = {
     "gbt": "論文 A：每個手勢一個二元 Gradient Boosting（特徵表 I）",
     "rf": "Random Forest（同一組特徵，對照用）",
     "svm": "論文 B：32 點波形包絡 + 線性 SVM",
     "knn": "論文 B：32 點波形包絡 + 1-NN",
+    "wlr": "固定視窗波形（觸發前 0.3 s～後 3 s，20 Hz）+ 邏輯迴歸",
+    "wknn": "固定視窗波形 + 3-NN",
 }
+WINDOW_MODELS = {"wlr", "wknn"}  # these read the "win" field of extract(), the others the "seg" field
+
+
+def model_field(kind):
+    return "win" if kind in WINDOW_MODELS else "seg"
 
 
 def make_model(kind, n_estimators=300, seed=0):
@@ -513,6 +584,11 @@ def make_model(kind, n_estimators=300, seed=0):
         return Pipeline([("feat", SegmentFeaturizer(PAPER_B)), ("clf", LinearSVM())])
     if kind == "knn":
         return Pipeline([("feat", SegmentFeaturizer(PAPER_B)), ("clf", KNeighborsClassifier(n_neighbors=1))])
+    if kind == "wlr":
+        return Pipeline([("feat", WaveFeaturizer()), ("scale", StandardScaler()),
+                         ("clf", LogisticRegression(C=0.05, max_iter=3000))])
+    if kind == "wknn":
+        return Pipeline([("feat", WaveFeaturizer()), ("clf", KNeighborsClassifier(n_neighbors=3, weights="distance"))])
     raise ValueError(f"unknown model {kind!r}, choose from {', '.join(MODELS)}")
 
 
@@ -525,6 +601,8 @@ def feature_importance(model):
         imp = clf.feature_importances_
     else:
         return []
+    if not hasattr(model.named_steps["feat"], "names_"):
+        return []
     names = model.named_steps["feat"].names_
     return sorted(zip(names, imp), key=lambda p: -p[1])
 
@@ -536,7 +614,9 @@ class LivePredictor:
     rest calibration -> trigger -> wait for the window -> extract -> classify."""
 
     def __init__(self, bundle, calib_seconds=8.0, calib_range=None):
+        check_bundle(bundle)
         self.cfg = SegConfig(**bundle["cfg"])
+        self.field = bundle.get("field", "seg")
         self.model = bundle["model"]
         self.classes = list(self.model.classes_)
         self.buf = GrowBuffer(2)
@@ -584,9 +664,10 @@ class LivePredictor:
             r = extract(red_all, ir_all, onset, self.cal, self.cfg)
             if r is None or r["seg"].shape[1] < 8:
                 continue
-            proba = self.model.predict_proba(as_objects([r["seg"]]))[0]
+            proba = self.model.predict_proba(as_objects([r[self.field]]))[0]
             best = int(np.argmax(proba))
-            r.update(onset=onset, proba=proba, label=self.classes[best], conf=float(proba[best]))
+            r.update(onset=onset, proba=proba, label=self.classes[best], conf=float(proba[best]),
+                     reject=self.classes[best] == NONE)
             results.append(r)
         return results
 
@@ -595,5 +676,17 @@ class LivePredictor:
             self.score.extend(np.zeros(n - len(self.score)))
 
 
+BUNDLE_VERSION = 2
+
+
 def bundle_for(model, labels, cfg: SegConfig, **extra):
-    return {"model": model, "labels": list(labels), "cfg": asdict(cfg), "version": 1, **extra}
+    return {"model": model, "labels": list(labels), "cfg": asdict(cfg), "version": BUNDLE_VERSION, **extra}
+
+
+def check_bundle(bundle):
+    """Refuse models trained with a different pipeline instead of silently filling in defaults."""
+    names = {f.name for f in fields(SegConfig)}
+    missing = names - set(bundle.get("cfg", {}))
+    if bundle.get("version", 1) < BUNDLE_VERSION or missing:
+        raise SystemExit("這個模型是用舊版程式訓練的（設定不完整），結果會跟訓練時不一樣。\n"
+                         "請重新執行 train.py 訓練一次。")
